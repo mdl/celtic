@@ -16,5 +16,9 @@
     "url": "https://github.com/mdl/celtic/issues"
   },
   "homepage": "https://github.com/mdl/celtic#readme",
-  "description": ""
+  "description": "",
+  "dependencies": {
+    "@datastructures-js/priority-queue": "^6.3.2",
+    "@datastructures-js/queue": "^4.2.3"
+  }
 }

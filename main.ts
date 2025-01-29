@@ -1,6 +1,6 @@
-// ----------------------------------
-// 1. Definitions
-// ----------------------------------
+import { MinPriorityQueue } from '@datastructures-js/priority-queue';
+import { Queue } from '@datastructures-js/queue';
+
 interface Skill {
   skillName: string;
   castTimeS: number;           // How long it takes to cast
@@ -9,17 +9,11 @@ interface Skill {
   possibleSkillGear: number[]; // e.g. [0, 10, 30] => recast can be reduced by 0%, 10%, or 30%
 }
 
-// A convenience type for the scheduling result
 interface ScheduleResult {
   totalDamage: number;
   sequence: string[];
 }
 
-/**
- * generateAllGearChoices:
- *   Returns all ways of picking *exactly one* recast-% from each skill's possibleSkillGear.
- *   E.g. if skill1 has gear [0,10], skill2 has gear [15], => [[0,15], [10,15]].
- */
 function generateAllGearChoices(skills: Skill[]): number[][] {
   const results: number[][] = [];
   const gearArrays = skills.map(s => s.possibleSkillGear);
@@ -39,106 +33,127 @@ function generateAllGearChoices(skills: Skill[]): number[][] {
   return results;
 }
 
-// ----------------------------------
-// 2. Branch-and-Bound DFS to Maximize Damage
-// ----------------------------------
-/**
- * Given a chosen gear configuration, find the best (maximum damage) schedule
- * within timeLimit seconds. We do a DFS over possible next skill to cast:
- *   - We track 'currentTime'
- *   - Each skill has a 'nextAvailableTime'
- *   - We only cast if nextAvailableTime <= currentTime, and if the cast ends before timeLimit
- *   - Accumulate damage and keep track of best schedule
- *
- * This method returns the maximum totalDamage (and the sequence of skill casts).
- */
 function findBestDamageSchedule(
   skills: Skill[],
-  gearCombo: number[],  // e.g. [10, 0, 15], one % recast reduction for each skill
-  timeLimit: number     // total time window (seconds) in which to cast
+  gearCombo: number[],
+  timeLimit: number
 ): ScheduleResult {
-  // Precompute effective recast times for each skill
-  // e.g. 30 => means 30% recast reduction => skill.recastTimeS * (1 - 0.30)
+  // 1) Precompute effective recast times
   const effectiveRecast = skills.map((skill, i) => {
     const pct = gearCombo[i] / 100;
     return skill.recastTimeS * (1 - pct);
   });
 
-  // Global best tracking
-  let bestDamageSoFar = 0;
-  let bestSequenceSoFar: string[] = [];
+  interface State {
+    currentTime: number;
+    damageSoFar: number;
+    nextAvail: number[];
+    castSequence: string[];
+  }
 
-  /**
-   * DFS state:
-   *   - currentTime
-   *   - totalDamageSoFar
-   *   - nextAvailTimes[]: next time each skill is off cooldown
-   *   - castSequence: list of skill names so far
-   */
-  function dfs(
-    currentTime: number,
-    totalDamageSoFar: number,
-    nextAvailTimes: number[],
-    castSequence: string[]
-  ) {
-    // If we've reached a new best, record it
-    if (totalDamageSoFar > bestDamageSoFar) {
-      bestDamageSoFar = totalDamageSoFar;
-      bestSequenceSoFar = [...castSequence];
-    }
+  // 2) The BFS queue
+  const queue = new Queue<State>();
+  const initial: State = {
+    currentTime: 0,
+    damageSoFar: 0,
+    nextAvail: skills.map(() => 0),
+    castSequence: []
+  };
+  queue.enqueue(initial);
 
-    // Optional: we can attempt a bounding check here, for example:
-    // - If there's not enough time to surpass the bestDamageSoFar, prune.
-    //   But that typically requires estimating max potential damage from here on out,
-    //   which we won't do for simplicity.
+  // 3) We'll keep track of only the top 1000 states per time checkpoint
+  //    using a dictionary: checkpoint => MinPriorityQueue of states
+  //    with priority = damageSoFar (lowest is popped first).
+  const topStatesPerCheckpoint: Record<number, MinPriorityQueue<State>> = {};
 
-    // Try to cast each skill next
-    for (let i = 0; i < skills.length; i++) {
-      const skill = skills[i];
-      const earliestStart = nextAvailTimes[i]; // can't start skill i before this
-      if (earliestStart > timeLimit) {
-        // If it won't even become available before time limit, no use
-        continue;
-      }
-
-      // We'll start at max(currentTime, earliestStart)
-      const startTime = Math.max(currentTime, earliestStart);
-      // The cast ends at castEnd
-      const castEnd = startTime + skill.castTimeS;
-
-      // If castEnd goes beyond the time limit, skip it
-      if (castEnd > timeLimit) {
-        continue;
-      }
-
-      // Then, after finishing, the next available time for skill i is:
-      const oldNextAvail = nextAvailTimes[i];
-      nextAvailTimes[i] = castEnd + effectiveRecast[i];
-
-      // Add damage
-      castSequence.push(skill.skillName);
-      dfs(
-        castEnd,                      // new "current time"
-        totalDamageSoFar + skill.damage,
-        nextAvailTimes,
-        castSequence
-      );
-
-      // Backtrack
-      castSequence.pop();
-      nextAvailTimes[i] = oldNextAvail;
+  function ensureQueueForCheckpoint(cp: number) {
+    if (!topStatesPerCheckpoint[cp]) {
+      topStatesPerCheckpoint[cp] = new MinPriorityQueue<State>((state) => state.damageSoFar);
     }
   }
 
-  // Initialize nextAvailTimes to 0 for all skills (all ready at t=0).
-  const nextAvailTimes = skills.map(() => 0);
-  dfs(0, 0, nextAvailTimes, []);
+  // 4) Global best tracking
+  let bestDamage = 0;
+  let bestSequence: string[] = [];
 
+  let expansions = 0;
+
+  // 5) BFS
+  while (!queue.isEmpty()) {
+    const state = queue.dequeue();
+    expansions++;
+
+    // // Log progress occasionally
+    // if (expansions % 5000000 === 0) {
+    //   console.log(`[${state.currentTime.toFixed(2)}s] expansions=${expansions}, queueSize=${queue.size()}, bestDamage=${bestDamage}`);
+    // }
+
+    // Update global best
+    if (state.damageSoFar > bestDamage) {
+      bestDamage = state.damageSoFar;
+      bestSequence = state.castSequence.slice();
+    }
+
+    // Expand all skills from this state
+    for (let i = 0; i < skills.length; i++) {
+      const skill = skills[i];
+      const earliestStart = state.nextAvail[i];
+      if (earliestStart > timeLimit) continue;
+
+      const startTime = Math.max(state.currentTime, earliestStart);
+      const castEnd = startTime + skill.castTimeS;
+      if (castEnd > timeLimit) continue;
+
+      const newDamage = state.damageSoFar + skill.damage;
+
+      const newNextAvail = [...state.nextAvail];
+      newNextAvail[i] = castEnd + effectiveRecast[i];
+
+      const newSequence = [...state.castSequence, skill.skillName];
+
+      const newState: State = {
+        currentTime: castEnd,
+        damageSoFar: newDamage,
+        nextAvail: newNextAvail,
+        castSequence: newSequence
+      };
+
+      // --- Determine the checkpoint bucket
+      // You might choose 5-second increments. We'll do 5s here:
+      const checkpoint = Math.floor(castEnd / 5) * 5;
+
+      // Make sure we have a min-heap for this checkpoint
+      ensureQueueForCheckpoint(checkpoint);
+
+      const heap = topStatesPerCheckpoint[checkpoint];
+
+      // If there's space in this heap (< 1000), or we beat the min in the heap, we keep it.
+      if (heap.size() < 10000) {
+        heap.enqueue(newState);
+        queue.enqueue(newState);
+      } else {
+        // Check the worst (min damage) in the top-1000
+        const worstTopState = heap.front(); // min item
+        if (worstTopState && newDamage > worstTopState.damageSoFar) {
+          // we are better => pop the old min, push new
+          heap.dequeue();
+          heap.enqueue(newState);
+
+          // Also push to BFS queue
+          queue.enqueue(newState);
+        }
+        // else we do nothing => prune
+      }
+    }
+  }
+
+  // 6) Return final best
   return {
-    totalDamage: bestDamageSoFar,
-    sequence: bestSequenceSoFar
+    totalDamage: bestDamage,
+    sequence: bestSequence
   };
 }
+
 
 // ----------------------------------
 // 3. Combine: pick the best gear & schedule
@@ -170,6 +185,13 @@ function findBestDpsSetup(
       timeLimit
     );
 
+    console.log()
+    console.log("===DPS Setup ===");
+    console.log("Gear chosen (%):", gearCombo);
+    console.log("Total Damage in", timeLimit, "s:", totalDamage);
+    console.log("Cast Sequence:", sequence.join(" -> "));
+    console.log()
+    console.log()
     if (totalDamage > topDamage) {
       // strictly better damage
       topDamage = totalDamage;
@@ -207,7 +229,7 @@ function findBestDpsSetup(
       castTimeS: 1,
       recastTimeS: 6.7,
       damage: 10300,
-      possibleSkillGear: [0, 15],
+      possibleSkillGear: [0, 15, 20, 25, 30],
     },
     {
       skillName: "Fire Storm",
@@ -221,7 +243,7 @@ function findBestDpsSetup(
       castTimeS: 4,
       recastTimeS: 20,
       damage: 14000,
-      possibleSkillGear: [0],
+      possibleSkillGear: [0, 30],
     },
     {
       skillName: "Ice Shards",
@@ -262,11 +284,5 @@ function findBestDpsSetup(
 
   // Example: We want to schedule up to 60 seconds to maximize total damage (thus maximizing DPS).
   const timeLimit = 60;
-  const result = findBestDpsSetup(skills, timeLimit);
-
-  console.log("=== Best DPS Setup ===");
-  console.log("Gear chosen (%):", result.chosenGearPercents);
-  console.log("Total Damage in", timeLimit, "s:", result.bestDamage);
-  console.log("DPS:", result.bestDps.toFixed(2));
-  console.log("Cast Sequence:", result.castSequence.join(" -> "));
+  findBestDpsSetup(skills, timeLimit);
 })();
